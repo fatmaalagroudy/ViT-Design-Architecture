@@ -1,15 +1,11 @@
-// Fixed High-Performance SV ViT (vit_top_integrated_fixed.sv)
-// Critical Fixes:
-// 1. Patch embedding bias scaling corrected
-// 2. Intermediate value precision maintained
-// 3. Proper scaling chain through all stages
 `timescale 1ns / 1ps
 
 import dyadic_params::*;
 
 module vit_top_integrated #(
-    parameter string BASE_DIR = "C:/Users/user/Downloads/vit_new/export_quantized_new/",
-    parameter string VERSION_TAG = "V_ATTN_FIX_V11"
+    // Path to folder containing all .mem weight files.
+    parameter string WEIGHT_DIR = "weights/",
+    parameter string VERSION_TAG = "V_ATTN_FIX_V11_QKV_PROJ_MLP1_MLP2_MIRROR"
 )(
     input  logic clk,
     input  logic rst,
@@ -61,52 +57,143 @@ module vit_top_integrated #(
     logic [6:0] patch_cnt_j;
     logic [7:0] pixel_cnt;
     logic [3:0] head_cnt;
+    logic [3:0] col_tile;   // Output column tile index (each tile = 64 output cols)
 
     // --- PIPELINED COMPONENT INTERFACES ---
-    
-    // MMU 1: 64x256x768 (Used for QKV, MLP1)
-    logic mmu1_start, mmu1_done;
-    logic signed [7:0] mmu1_a [64][256];
-    logic signed [63:0] mmu1_bias [768];
-    logic signed [63:0] mmu1_out [64][768];
-    simple_mmu #(64, 256, 768) u_mmu1 (
-        .clk(clk), .rst(rst), .start(mmu1_start),
-        .A(mmu1_a), .B(b_qkv_w[b_curr]), .bias(mmu1_bias),
-        .C(mmu1_out), .done(mmu1_done)
+
+    // Feed counters: one per MMU instance, count k-index during FEED state
+    logic [8:0] mmu1_feed_k;
+    logic [8:0] mmu1_p_feed_k;
+    logic [8:0] mmu2_feed_k;
+    logic [8:0] mmu2_p_feed_k;
+
+    // MMU 1: used for QKV (64x256→768) and reused for other 64-col-tile ops
+    logic mmu_start, mmu_done;
+    logic [15:0] tile_dim;
+    logic signed [7:0]  mmu1_a   [64][256];
+    logic signed [63:0] mmu_out [0:63][0:63];   // MMU native 64×64 output
+    logic signed [63:0] mmu1_buf [64][768];       // Legacy wide accumulation buffer for QKV (kept for compatibility/debug)
+
+    // Generic ping-pong matrix buffer integrated for QKV only
+    logic qkv_buf_wr_en;
+    logic qkv_buf_swap;
+    logic signed [63:0] qkv_buf_rd_matrix [0:63][0:767];
+
+    logic signed [7:0]  mmu_row [0:63];
+    logic signed [7:0]  mmu_col [0:63];
+    logic signed [7:0]  mmu1_row [0:63];
+    logic signed [7:0]  mmu1_col [0:63];
+    logic signed [7:0]  mmu1_dummy_a [0:63];      // Unused dual-port inputs
+    logic signed [7:0]  mmu1_dummy_b [0:63];
+    mmu_modular_64x64 u_mmu1 (
+        .clk(clk), .rst(rst), .start(mmu_start),
+        .mode(2'd0), .K_dim(tile_dim),
+        .done(mmu_done), .busy(),
+        .matrix_a_row(mmu_row), .matrix_b_col(mmu_col),
+        .matrix_a_row_b(mmu1_dummy_a), .matrix_b_col_b(mmu1_dummy_b),
+        .result_c(mmu_out), .result_c_b(),
+        .result_valid(), .result_valid_b()
     );
+    assign mmu1_dummy_a = '{default: 8'sd0};
+    assign mmu1_dummy_b = '{default: 8'sd0};
 
     // MMU for Attention Projection (64x256x256)
-    logic mmu1_p_start, mmu1_p_done;
-    logic signed [7:0] attn_out [64][256]; // Output of attention @ V, input to proj
-    logic signed [63:0] mmu1_p_bias [256];
-    logic signed [63:0] mmu1_p_out [64][256];
-    simple_mmu #(64, 256, 256) u_mmu1_proj (
-        .clk(clk), .rst(rst), .start(mmu1_p_start),
-        .A(attn_out), .B(b_atn_p_w[b_curr]), .bias(mmu1_p_bias),
-        .C(mmu1_p_out), .done(mmu1_p_done)
-    );
+    //logic mmu_start, mmu_done;
+    logic signed [7:0]  attn_out      [64][256];  // Output of attention @ V, input to proj
+    //logic signed [63:0] mmu_out    [0:63][0:63]; // MMU native 64×64 output
+    logic signed [63:0] mmu1_p_buf    [64][256];    // Wide accumulation buffer for proj
+    logic signed [7:0]  mmu1_p_row    [0:63];
+    logic signed [7:0]  mmu1_p_col    [0:63];
+    logic signed [7:0]  mmu1_p_dummy_a [0:63];
+    logic signed [7:0]  mmu1_p_dummy_b [0:63];
+
+    assign mmu1_p_dummy_a = '{default: 8'sd0};
+    assign mmu1_p_dummy_b = '{default: 8'sd0};
 
     // MMU for MLP1 (64x256x768)
-    logic mmu2_start, mmu2_done;
-    logic signed [7:0] mmu2_a [64][256]; // Input to MLP1
-    logic signed [63:0] mmu2_bias [768];
-    logic signed [63:0] mmu2_out [64][768];
-    simple_mmu #(64, 256, 768) u_mmu2 (
-        .clk(clk), .rst(rst), .start(mmu2_start),
-        .A(mmu2_a), .B(b_mlp1_w[b_curr]), .bias(mmu2_bias),
-        .C(mmu2_out), .done(mmu2_done)
-    );
+    //logic mmu_start, mmu_done;
+    logic signed [7:0]  mmu2_a   [64][256];       // Input to MLP1
+    logic signed [63:0] mmu2_out [0:63][0:63];    // MMU native 64×64 output
+    logic signed [63:0] mmu2_buf [64][768];        // Wide accumulation buffer for MLP1
+    logic signed [7:0]  mmu2_row [0:63];
+    logic signed [7:0]  mmu2_col [0:63];
+    logic signed [7:0]  mmu2_dummy_a [0:63];
+    logic signed [7:0]  mmu2_dummy_b [0:63];
 
-    // MMU for MLP2 (64x768x256)
-    logic mmu2_p_start, mmu2_p_done;
-    logic signed [7:0] mmu2_p_a [64][768]; // Input to MLP2 (GELU output)
-    logic signed [63:0] mmu2_p_bias [256];
-    logic signed [63:0] mmu2_p_out [64][256];
-    simple_mmu #(64, 768, 256) u_mmu2_proj (
-        .clk(clk), .rst(rst), .start(mmu2_p_start),
-        .A(mmu2_p_a), .B(b_mlp2_w[b_curr]), .bias(mmu2_p_bias),
-        .C(mmu2_p_out), .done(mmu2_p_done)
-    );
+    assign mmu2_dummy_a = '{default: 8'sd0};
+    assign mmu2_dummy_b = '{default: 8'sd0};
+
+    // Generic ping-pong matrix buffer mirrored for MLP1 only
+    logic mlp1_buf_wr_en;
+    logic mlp1_buf_swap;
+    logic signed [63:0] mlp1_buf_rd_matrix [0:63][0:767];
+
+    // MMU for MLP2 (64x768x256) — K=768, output cols=256 (4 tiles of 64)
+    //logic mmu_start, mmu_done;
+    logic signed [7:0]  mmu2_p_a   [64][768];      // Input to MLP2 (GELU output)
+    logic signed [63:0] mmu2_p_out [0:63][0:63];   // MMU native 64×64 output
+    logic signed [63:0] mmu2_p_buf [64][256];       // Wide accumulation buffer for MLP2
+    logic signed [7:0]  mmu2_p_row [0:63];
+    logic signed [7:0]  mmu2_p_col [0:63];
+    logic signed [7:0]  mmu2_p_dummy_a [0:63];
+    logic signed [7:0]  mmu2_p_dummy_b [0:63];
+
+    assign mmu2_p_dummy_a = '{default: 8'sd0};
+    assign mmu2_p_dummy_b = '{default: 8'sd0};
+
+    // Generic ping-pong matrix buffer mirrored for MLP2 only
+    logic mlp2_buf_wr_en;
+    logic mlp2_buf_swap;
+    logic signed [63:0] mlp2_buf_rd_matrix [0:63][0:255];
+
+    always_comb begin
+        for (int i = 0; i < 64; i++) mmu_row[i] = 8'sd0;
+        for (int j = 0; j < 64; j++) mmu_col[j] = 8'sd0;
+        if (u_mmu1.state == u_mmu1.FEED && u_mmu1.feed_cycle < 32) begin
+            case (state)
+                ST_QKV: begin
+                    for (int i = 0; i < 64; i++)
+                        mmu_row[i] = mmu1_a[i][u_mmu1.k_tile_32 * 32 + mmu1_feed_k];
+                    for (int j = 0; j < 64; j++)
+                        mmu_col[j] = b_qkv_w[b_curr][col_tile * 64 + j][u_mmu1.k_tile_32 * 32 + mmu1_feed_k];
+                end
+                ST_PROJ: begin
+                    for (int i = 0; i < 64; i++)
+                        mmu_row[i] = attn_out[i][u_mmu1.k_tile_32 * 32 + mmu1_feed_k];
+                    for (int j = 0; j < 64; j++)
+                        mmu_col[j] = b_atn_p_w[b_curr][col_tile * 64 + j][u_mmu1.k_tile_32 * 32 + mmu1_feed_k];
+                end
+                ST_MLP1: begin
+                    for (int i = 0; i < 64; i++)
+                        mmu_row[i] = mmu2_a[i][u_mmu1.k_tile_32 * 32 + mmu1_feed_k];
+                    for (int j = 0; j < 64; j++)
+                        mmu_col[j] = b_mlp1_w[b_curr][col_tile * 64 + j][u_mmu1.k_tile_32 * 32 + mmu1_feed_k];
+                end
+                ST_MLP2: begin
+                    for (int i = 0; i < 64; i++)
+                        mmu_row[i] = mmu2_p_a[i][u_mmu1.k_tile_32 * 32 + mmu1_feed_k];
+                    for (int j = 0; j < 64; j++)
+                        mmu_col[j] = b_mlp2_w[b_curr][col_tile * 64 + j][u_mmu1.k_tile_32 * 32 + mmu1_feed_k];
+                end
+                default: begin end
+            endcase
+        end
+    end
+
+    // Single feed counter — all four stages use the same MMU so one counter suffices
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            mmu1_feed_k   <= 0;
+            mmu1_p_feed_k <= 0;
+            mmu2_feed_k   <= 0;
+            mmu2_p_feed_k <= 0;
+        end else begin
+            mmu1_feed_k   <= (u_mmu1.state == u_mmu1.FEED) ? (mmu1_feed_k < 31 ? mmu1_feed_k + 1 : 31) : 0;
+            mmu1_p_feed_k <= mmu1_feed_k;
+            mmu2_feed_k   <= mmu1_feed_k;
+            mmu2_p_feed_k <= mmu1_feed_k;
+        end
+    end
 
     // LayerNorm
     logic ln_start, ln_done;
@@ -133,22 +220,22 @@ module vit_top_integrated #(
 
     // Weight loading
     initial begin
-        $display("[%0t] Loading weights from %s...", $time, BASE_DIR);
+        $display("[%0t] Loading weights from %s...", $time, WEIGHT_DIR);
         // Primary weight/bias loading - Use 1D buffer for 4D/3D arrays to ensure simulator stability
         begin
             static logic [31:0] tmp_v_large [196608];
             static logic [31:0] tmp_b_large [768];
             
             // Pos Embed
-            $readmemh({BASE_DIR, "pos_embed.mem"}, tmp_v_large);
+            $readmemh({WEIGHT_DIR, "pos_embed.mem"}, tmp_v_large);
             for (int i=0; i<64; i++) for (int j=0; j<256; j++) pos_embed[i][j] = tmp_v_large[i*256 + j][7:0];
 
             // Patch Proj (4D)
-            $readmemh({BASE_DIR, "patch_embed_proj_weight.mem"}, tmp_v_large);
+            $readmemh({WEIGHT_DIR, "patch_embed_proj_weight.mem"}, tmp_v_large);
             for (int d=0; d<256; d++) for (int c=0; c<3; c++) for (int r=0; r<8; r++) for (int col=0; col<8; col++)
                 patch_w[d][c][r][col] = tmp_v_large[d*3*8*8 + c*8*8 + r*8 + col][7:0];
             
-            $readmemh({BASE_DIR, "patch_embed_proj_bias.mem"}, tmp_b_large);
+            $readmemh({WEIGHT_DIR, "patch_embed_proj_bias.mem"}, tmp_b_large);
             for (int d=0; d<256; d++) patch_b[d] = tmp_b_large[d];
         
             // Block weights
@@ -156,51 +243,51 @@ module vit_top_integrated #(
                 string b_idx; b_idx.itoa(i);
                 
                 // Norm 1
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_norm1_weight.mem"}, tmp_v_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_norm1_weight.mem"}, tmp_v_large);
                 for (int j=0; j<256; j++) b_norm1_w[i][j] = tmp_v_large[j][7:0];
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_norm1_bias.mem"}, tmp_b_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_norm1_bias.mem"}, tmp_b_large);
                 for (int j=0; j<256; j++) b_norm1_b[i][j] = tmp_b_large[j];
                 
                 // QKV
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_attn_qkv_weight.mem"}, tmp_v_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_attn_qkv_weight.mem"}, tmp_v_large);
                 for (int m=0; m<768; m++) for (int d=0; d<256; d++) b_qkv_w[i][m][d] = tmp_v_large[m*256 + d][7:0];
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_attn_qkv_bias.mem"}, tmp_b_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_attn_qkv_bias.mem"}, tmp_b_large);
                 for (int m=0; m<768; m++) b_qkv_b[i][m] = tmp_b_large[m];
                 
                 // Attn Proj
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_attn_proj_weight.mem"}, tmp_v_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_attn_proj_weight.mem"}, tmp_v_large);
                 for (int m=0; m<256; m++) for (int d=0; d<256; d++) b_atn_p_w[i][m][d] = tmp_v_large[m*256 + d][7:0];
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_attn_proj_bias.mem"}, tmp_b_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_attn_proj_bias.mem"}, tmp_b_large);
                 for (int j=0; j<256; j++) b_atn_p_b[i][j] = tmp_b_large[j];
                 
                 // Norm 2
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_norm2_weight.mem"}, tmp_v_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_norm2_weight.mem"}, tmp_v_large);
                 for (int j=0; j<256; j++) b_norm2_w[i][j] = tmp_v_large[j][7:0];
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_norm2_bias.mem"}, tmp_b_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_norm2_bias.mem"}, tmp_b_large);
                 for (int j=0; j<256; j++) b_norm2_b[i][j] = tmp_b_large[j];
                 
                 // MLP
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_mlp_fc1_weight.mem"}, tmp_v_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_mlp_fc1_weight.mem"}, tmp_v_large);
                 for (int m=0; m<768; m++) for (int d=0; d<256; d++) b_mlp1_w[i][m][d] = tmp_v_large[m*256 + d][7:0];
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_mlp_fc1_bias.mem"}, tmp_b_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_mlp_fc1_bias.mem"}, tmp_b_large);
                 for (int m=0; m<768; m++) b_mlp1_b[i][m] = tmp_b_large[m];
                 
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_mlp_fc2_weight.mem"}, tmp_v_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_mlp_fc2_weight.mem"}, tmp_v_large);
                 for (int m=0; m<256; m++) for (int d=0; d<768; d++) b_mlp2_w[i][m][d] = tmp_v_large[m*768 + d][7:0];
-                $readmemh({BASE_DIR, "blocks_", b_idx, "_mlp_fc2_bias.mem"}, tmp_b_large);
+                $readmemh({WEIGHT_DIR, "blocks_", b_idx, "_mlp_fc2_bias.mem"}, tmp_b_large);
                 for (int j=0; j<256; j++) b_mlp2_b[i][j] = tmp_b_large[j];
             end
             
             // Final Norm
-            $readmemh({BASE_DIR, "norm_weight.mem"}, tmp_v_large);
+            $readmemh({WEIGHT_DIR, "norm_weight.mem"}, tmp_v_large);
             for (int j=0; j<256; j++) norm_f_w[j] = tmp_v_large[j][7:0];
-            $readmemh({BASE_DIR, "norm_bias.mem"}, tmp_b_large);
+            $readmemh({WEIGHT_DIR, "norm_bias.mem"}, tmp_b_large);
             for (int j=0; j<256; j++) norm_f_b[j] = tmp_b_large[j];
             
             // Head
-            $readmemh({BASE_DIR, "head_weight.mem"}, tmp_v_large);
+            $readmemh({WEIGHT_DIR, "head_weight.mem"}, tmp_v_large);
             for (int c=0; c<10; c++) for (int j=0; j<256; j++) head_w[c][j] = tmp_v_large[c*256 + j][7:0];
-            $readmemh({BASE_DIR, "head_bias.mem"}, tmp_b_large);
+            $readmemh({WEIGHT_DIR, "head_bias.mem"}, tmp_b_large);
             for (int c=0; c<10; c++) head_b[c] = tmp_b_large[c];
         end
         
@@ -224,19 +311,21 @@ module vit_top_integrated #(
     always_ff @(posedge clk or posedge rst) begin
         if (rst) begin
             state <= ST_IDLE; done <= 0; b_curr <= 0;
-            ln_start <= 0; mmu1_start <= 0; mmu1_p_start <= 0; mmu2_start <= 0; mmu2_p_start <= 0;
+            ln_start <= 0; mmu_start <= 0; //mmu_start <= 0; mmu_start <= 0; mmu_start <= 0;
             gelu_start <= 0; soft_start <= 0;
-            patch_cnt <= 0; pixel_cnt <= 0;
-            for (int i=0; i<64; i++) for (int j=0; j<256; j++) mmu1_a[i][j] <= 0;
-            for (int i=0; i<64; i++) for (int j=0; j<256; j++) mmu2_a[i][j] <= 0;
-            for (int i=0; i<64; i++) for (int j=0; j<768; j++) mmu2_p_a[i][j] <= 0;
-            for (int i=0; i<64; i++) for (int j=0; j<256; j++) x[i][j] <= 0;
-            for (int i=0; i<64; i++) for (int j=0; j<256; j++) attn_out[i][j] <= 0;
+            qkv_buf_wr_en <= 0; qkv_buf_swap <= 0;
+            patch_cnt <= 0; pixel_cnt <= 0; col_tile <= 0;
+            for (int i=0; i<64; i++) for (int d=0; d<256; d++) attn_out[i][d] <= 8'sd0;
+            for (int i=0; i<64; i++) for (int d=0; d<768; d++) begin mmu1_buf[i][d] <= 0; mmu2_buf[i][d] <= 0; end
+            for (int i=0; i<64; i++) for (int d=0; d<256; d++) begin mmu1_p_buf[i][d] <= 0; mmu2_p_buf[i][d] <= 0; end
             for (int h=0; h<8; h++) for (int i=0; i<64; i++) for (int j=0; j<64; j++) attn_weights[h][i][j] <= 0;
             for (int h=0; h<8; h++) for (int i=0; i<64; i++) for (int d=0; d<32; d++) begin
                 q[h][i][d] <= 0; k[h][i][d] <= 0; v[h][i][d] <= 0;
             end
         end else begin
+            // one-cycle pulses for QKV buffer control
+            qkv_buf_wr_en <= 0;
+            qkv_buf_swap  <= 0;
             case (state)
                 ST_IDLE: if (start) begin 
                     state <= ST_PATCH_EMBED; patch_cnt <= 0; pixel_cnt <= 0; b_curr <= 0;
@@ -364,51 +453,71 @@ module vit_top_integrated #(
                 end
                 
                 ST_QKV: begin
-                    if (!mmu1_start && !mmu1_done) begin
-                        // Assign bias and WAIT TWO cycles for it to propagate fully
-                        for(int i=0; i<768; i++) begin 
-                            automatic logic signed [127:0] bias_scaled = ($signed(b_qkv_b[b_curr][i]) * $signed(128'(dyadic_params::qkv_bias_m[b_curr]))) >>> dyadic_params::qkv_bias_s[b_curr];
-                            mmu1_bias[i] <= bias_scaled[63:0]; 
-                        end
-                        if (patch_cnt < 2) begin
-                            patch_cnt <= patch_cnt + 1; // 2-cycle wait
-                        end else begin
-                            mmu1_start <= 1; 
-                            patch_cnt <= 0;
-                            $display("[%0t] Starting QKV MMU. mmu1_a[0][0:3] = %d %d %d %d", $time, 
-                                     $signed(mmu1_a[0][0]), $signed(mmu1_a[0][1]), $signed(mmu1_a[0][2]), $signed(mmu1_a[0][3]));
-                        end
-                    end else if (mmu1_done) begin 
-                        mmu1_start <= 0; 
-                        
-                        // Reshape QKV output: [64, 768] -> [64, 3, 8, 32]
-                        for(int p=0; p<64; p++) for(int qkv_idx=0; qkv_idx<3; qkv_idx++) for(int h=0; h<8; h++) for(int d=0; d<32; d++) begin
-                            automatic int flat_idx = qkv_idx * 256 + h * 32 + d;
-                            automatic logic signed [63:0] val = mmu1_out[p][flat_idx];
-                            
-                            // Store as int32 for attention computation
-                            // Store as int32 for attention computation with correct signed clamping
-                            if ($signed(val) > $signed(64'sd2147483647)) begin
-                                if (qkv_idx == 0) q[h][p][d] <= 32'sd2147483647;
-                                else if (qkv_idx == 1) k[h][p][d] <= 32'sd2147483647;
-                                else v[h][p][d] <= 32'sd2147483647;
-                            end else if ($signed(val) < $signed(-64'sd2147483648)) begin
-                                if (qkv_idx == 0) q[h][p][d] <= -32'sd2147483648;
-                                else if (qkv_idx == 1) k[h][p][d] <= -32'sd2147483648;
-                                else v[h][p][d] <= -32'sd2147483648;
-                            end else begin
-                                if (qkv_idx == 0) q[h][p][d] <= val[31:0];
-                                else if (qkv_idx == 1) k[h][p][d] <= val[31:0];
-                                else v[h][p][d] <= val[31:0];
+                    // Tile over output columns: 768 cols = 12 tiles of 64.
+                    // patch_cnt==99 is a sentinel meaning "buffer fully written, do reshape next cycle".
+                    if (patch_cnt == 99) begin
+                        // One cycle after all tiles written: QKV ping-pong read bank now holds complete data.
+                        patch_cnt <= 0;
+                        for (int p=0; p<64; p++) for (int qkv_idx=0; qkv_idx<3; qkv_idx++)
+                            for (int h=0; h<8; h++) for (int d=0; d<32; d++) begin
+                                automatic int flat_idx = qkv_idx * 256 + h * 32 + d;
+                                automatic logic signed [127:0] bias_scaled = ($signed(b_qkv_b[b_curr][flat_idx]) * $signed(128'(dyadic_params::qkv_bias_m[b_curr]))) >>> dyadic_params::qkv_bias_s[b_curr];
+                                // Keep ping-pong as staging only, but consume the legacy mmu1_buf path unchanged
+                                // so Q/K/V ordering matches the original proven design.
+                                automatic logic signed [63:0] val = mmu1_buf[p][flat_idx] + bias_scaled[63:0];
+
+                                if ($signed(val) > $signed(64'sd2147483647)) begin
+                                    if (qkv_idx == 0) q[h][p][d] <= 32'sd2147483647;
+                                    else if (qkv_idx == 1) k[h][p][d] <= 32'sd2147483647;
+                                    else v[h][p][d] <= 32'sd2147483647;
+                                end else if ($signed(val) < $signed(-64'sd2147483648)) begin
+                                    if (qkv_idx == 0) q[h][p][d] <= -32'sd2147483648;
+                                    else if (qkv_idx == 1) k[h][p][d] <= -32'sd2147483648;
+                                    else v[h][p][d] <= -32'sd2147483648;
+                                end else begin
+                                    if (qkv_idx == 0) q[h][p][d] <= val[31:0];
+                                    else if (qkv_idx == 1) k[h][p][d] <= val[31:0];
+                                    else v[h][p][d] <= val[31:0];
+                                end
                             end
-                        end
-                        
-                        $display("[%0t]   [B%0d QKV Trace] Token 0 Output[0:3]: q=%0d k=%0d v=%0d", $time, b_curr, 
+
+                        $display("[%0t]   [B%0d QKV Trace] Token 0 Output[0:3]: q=%0d k=%0d v=%0d", $time, b_curr,
                                  $signed(q[0][0][0]), $signed(k[0][0][0]), $signed(v[0][0][0]));
                         $display("[%0t]   Expected:                                q=18186 k=777 v=-3036", $time);
-                        
-                        state <= ST_SOFT_SCORES; 
-                        patch_cnt <= 0; head_cnt <= 0; patch_cnt_j <= 0; 
+
+                        state <= ST_SOFT_SCORES;
+                        head_cnt <= 0; patch_cnt_j <= 0;
+
+                    end else if (!mmu_start && !mmu_done) begin
+                        if (patch_cnt < 2) begin
+                            patch_cnt <= patch_cnt + 1;
+                        end else begin
+                            mmu_start <= 1;
+                            tile_dim <= 16'd256; 
+                            patch_cnt <= 0;
+                            if (col_tile == 0)
+                                $display("[%0t] Starting QKV MMU tile %0d/12. mmu1_a[0][0:3] = %d %d %d %d", $time,
+                                         col_tile, $signed(mmu1_a[0][0]), $signed(mmu1_a[0][1]),
+                                         $signed(mmu1_a[0][2]), $signed(mmu1_a[0][3]));
+                        end
+                    end else if (mmu_done) begin
+                        mmu_start <= 0;
+
+                        // Write this 64-col tile into the generic ping-pong buffer.
+                        // Keep the legacy mirror write too for debug compatibility.
+                        qkv_buf_wr_en <= 1;
+                        for (int i = 0; i < 64; i++)
+                            for (int j = 0; j < 64; j++)
+                                mmu1_buf[i][col_tile * 64 + j] <= mmu_out[i][j];
+
+                        if (col_tile < 11) begin
+                            col_tile <= col_tile + 1;
+                        end else begin
+                            // Final tile for this block: publish freshly written bank for readout next cycle.
+                            qkv_buf_swap <= 1;
+                            col_tile <= 0;
+                            patch_cnt <= 99;  // sentinel: trigger reshape next cycle
+                        end
                     end
                 end
                 
@@ -499,31 +608,48 @@ module vit_top_integrated #(
                 end
                 
                 ST_PROJ: begin
-                    if (!mmu1_p_start && !mmu1_p_done) begin
-                        for(int i=0; i<256; i++) begin 
-                            automatic logic signed [127:0] bias_scaled = ($signed(b_atn_p_b[b_curr][i]) * $signed(128'(dyadic_params::proj_bias_m[b_curr]))) >>> dyadic_params::proj_bias_s[b_curr];
-                            mmu1_p_bias[i] <= bias_scaled[63:0]; 
+                    // Tile over 256 output columns = 4 tiles of 64.
+                    // patch_cnt==99: buffer fully written, apply bias next cycle.
+                    if (patch_cnt == 99) begin
+                        patch_cnt <= 0;
+                        col_tile <= 0;
+                        for (int i=0; i<64; i++) for (int j=0; j<256; j++) begin
+                            automatic logic signed [127:0] bias_scaled = ($signed(b_atn_p_b[b_curr][j]) * $signed(128'(dyadic_params::proj_bias_m[b_curr]))) >>> dyadic_params::proj_bias_s[b_curr];
+                            mmu1_p_buf[i][j] <= mmu1_p_buf[i][j] + bias_scaled[63:0];
                         end
-                        $display("[%0t] Block %0d ST_PROJ: Bias[0]=%d, Weight0[0,0]=%d, A[0,0]=%d, M=%d, S=%d", 
-                                 $time, b_curr, $signed(mmu1_p_bias[0]), $signed(b_atn_p_w[b_curr][0][0]), 
+                        state <= ST_RES1;
+                    end else if (!mmu_start && !mmu_done) begin
+                        $display("[%0t] Block %0d ST_PROJ tile %0d: Weight0[0,0]=%d, A[0,0]=%d, M=%d, S=%d",
+                                 $time, b_curr, col_tile, $signed(b_atn_p_w[b_curr][0][0]),
                                  $signed(attn_out[0][0]), dyadic_params::proj_bias_m[b_curr], dyadic_params::proj_bias_s[b_curr]);
                         if (patch_cnt < 2) patch_cnt <= patch_cnt + 1;
                         else begin
-                            mmu1_p_start <= 1; 
+                            mmu_start <= 1;
+                            tile_dim <= 16'd256;
                             patch_cnt <= 0;
                         end
-                    end else if (mmu1_p_done) begin 
-                        mmu1_p_start <= 0; 
-                        state <= ST_RES1; 
+                    end else if (mmu_done) begin
+                        mmu_start <= 0;
+                        // Store tile into wide buffer
+                        for (int i = 0; i < 64; i++)
+                            for (int j = 0; j < 64; j++)
+                                mmu1_p_buf[i][col_tile * 64 + j] <= mmu_out[i][j];
+
+                        if (col_tile < 3) begin
+                            col_tile <= col_tile + 1;
+                        end else begin
+                            // All 4 tiles written — wait one cycle then bias-add
+                            patch_cnt <= 99;
+                        end
                     end
                 end
                 
                 ST_RES1: begin
                     for(int i=0; i<64; i++) for(int j=0; j<256; j++) begin
-                        automatic logic signed [127:0] scaled = ($signed(mmu1_p_out[i][j]) * $signed(128'(dyadic_params::res1_proj_align_m[b_curr]))) >>> dyadic_params::res1_proj_align_s[b_curr];
+                        automatic logic signed [127:0] scaled = ($signed(mmu1_p_buf[i][j]) * $signed(128'(dyadic_params::res1_proj_align_m[b_curr]))) >>> dyadic_params::res1_proj_align_s[b_curr];
                         x[i][j] <= x[i][j] + scaled[63:0];
                     end
-                    state <= ST_LN2; 
+                    state <= ST_LN2;
                     patch_cnt <= 0;
                 end
                 
@@ -562,20 +688,41 @@ module vit_top_integrated #(
                 end
                 
                 ST_MLP1: begin
-                    if (!mmu2_start && !mmu2_done) begin
-                        for(int i=0; i<768; i++) begin 
-                            automatic logic signed [127:0] bias_scaled = ($signed(b_mlp1_b[b_curr][i]) * $signed(128'(dyadic_params::fc1_bias_m[b_curr]))) >>> dyadic_params::fc1_bias_s[b_curr];
-                            mmu2_bias[i] <= bias_scaled[63:0]; 
+                    // Tile over 768 output columns = 12 tiles of 64.
+                    // patch_cnt==99: buffer fully written, apply bias+gelu-in next cycle.
+                    if (patch_cnt == 99) begin
+                        patch_cnt <= 0;
+                        col_tile <= 0;
+                        for (int i=0; i<64; i++) for (int d=0; d<768; d++) begin
+                            automatic logic signed [127:0] bias_scaled = ($signed(b_mlp1_b[b_curr][d]) * $signed(128'(dyadic_params::fc1_bias_m[b_curr]))) >>> dyadic_params::fc1_bias_s[b_curr];
+                            gelu_in[i][d] <= mmu2_buf[i][d] + bias_scaled[63:0];
                         end
+                        state <= ST_GELU;
+                    end else if (!mmu_start && !mmu_done) begin
                         if (patch_cnt < 2) patch_cnt <= patch_cnt + 1;
                         else begin
-                            mmu2_start <= 1; 
+                            mmu_start <= 1;
+                            tile_dim <= 16'd256;
                             patch_cnt <= 0;
                         end
-                    end else if (mmu2_done) begin 
-                        mmu2_start <= 0; 
-                        for(int i=0; i<64; i++) for(int d=0; d<768; d++) gelu_in[i][d] <= mmu2_out[i][d]; 
-                        state <= ST_GELU; 
+                    end else if (mmu_done) begin
+                        mmu_start <= 0;
+                        // Mirror this 64-col tile into the MLP1 ping-pong buffer.
+                        // Keep the legacy wide buffer write unchanged for the verified datapath.
+                        mlp1_buf_wr_en <= 1;
+                        // Store tile into wide buffer
+                        for (int i = 0; i < 64; i++)
+                            for (int j = 0; j < 64; j++)
+                                mmu2_buf[i][col_tile * 64 + j] <= mmu_out[i][j];
+
+                        if (col_tile < 11) begin
+                            col_tile <= col_tile + 1;
+                        end else begin
+                            // Final tile mirrored; publish freshly written bank while legacy path remains unchanged.
+                            mlp1_buf_swap <= 1;
+                            // All 12 tiles written — wait one cycle then bias+gelu
+                            patch_cnt <= 99;
+                        end
                     end
                 end
                 
@@ -598,25 +745,47 @@ module vit_top_integrated #(
                 end
                 
                 ST_MLP2: begin
-                    if (!mmu2_p_start && !mmu2_p_done) begin
-                        for(int i=0; i<256; i++) begin 
-                            automatic logic signed [127:0] bias_scaled = ($signed(b_mlp2_b[b_curr][i]) * $signed(128'(dyadic_params::fc2_bias_m[b_curr]))) >>> dyadic_params::fc2_bias_s[b_curr];
-                            mmu2_p_bias[i] <= bias_scaled[63:0]; 
+                    // Tile over 256 output columns = 4 tiles of 64.
+                    // patch_cnt==99: buffer fully written, apply bias next cycle.
+                    if (patch_cnt == 99) begin
+                        patch_cnt <= 0;
+                        col_tile <= 0;
+                        for (int i=0; i<64; i++) for (int j=0; j<256; j++) begin
+                            automatic logic signed [127:0] bias_scaled = ($signed(b_mlp2_b[b_curr][j]) * $signed(128'(dyadic_params::fc2_bias_m[b_curr]))) >>> dyadic_params::fc2_bias_s[b_curr];
+                            mmu2_p_buf[i][j] <= mmu2_p_buf[i][j] + bias_scaled[63:0];
                         end
+                        state <= ST_RES2;
+                    end else if (!mmu_start && !mmu_done) begin
                         if (patch_cnt < 2) patch_cnt <= patch_cnt + 1;
                         else begin
-                            mmu2_p_start <= 1; 
+                            mmu_start <= 1;
+                            tile_dim <= 16'd768;
                             patch_cnt <= 0;
                         end
-                    end else if (mmu2_p_done) begin 
-                        mmu2_p_start <= 0; 
-                        state <= ST_RES2; 
+                    end else if (mmu_done) begin
+                        mmu_start <= 0;
+                        // Mirror this 64-col tile into the MLP2 ping-pong buffer.
+                        // Keep the legacy wide buffer write unchanged for the verified datapath.
+                        mlp2_buf_wr_en <= 1;
+                        // Store tile into wide buffer
+                        for (int i = 0; i < 64; i++)
+                            for (int j = 0; j < 64; j++)
+                                mmu2_p_buf[i][col_tile * 64 + j] <= mmu_out[i][j];
+
+                        if (col_tile < 3) begin
+                            col_tile <= col_tile + 1;
+                        end else begin
+                            // Final tile mirrored; publish freshly written bank while legacy path remains unchanged.
+                            mlp2_buf_swap <= 1;
+                            // All 4 tiles written — wait one cycle then bias-add
+                            patch_cnt <= 99;
+                        end
                     end
                 end
                 
                 ST_RES2: begin
                     for(int i=0; i<64; i++) for(int j=0; j<256; j++) begin
-                        automatic logic signed [127:0] scaled = ($signed(mmu2_p_out[i][j]) * $signed(128'(dyadic_params::res2_mlp_align_m[b_curr]))) >>> dyadic_params::res2_mlp_align_s[b_curr];
+                        automatic logic signed [127:0] scaled = ($signed(mmu2_p_buf[i][j]) * $signed(128'(dyadic_params::res2_mlp_align_m[b_curr]))) >>> dyadic_params::res2_mlp_align_s[b_curr];
                         x[i][j] <= x[i][j] + scaled[63:0];
                     end
                     begin

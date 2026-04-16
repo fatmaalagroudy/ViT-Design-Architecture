@@ -12,7 +12,7 @@
 
 module pe_8bit (
     input  wire clk,
-    input  wire rst_n,
+    input  wire rst,
     input  wire clear_acc,
     input  wire valid_in,
     input  wire signed [7:0] a_in,
@@ -20,11 +20,11 @@ module pe_8bit (
     output reg  valid_out,
     output reg  signed [7:0] a_out,
     output reg  signed [7:0] b_out,
-    output reg  signed [23:0] c_out
+    output reg  signed [63:0] c_out
 );
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
             valid_out <= 0;
             a_out     <= 0;
             b_out     <= 0;
@@ -45,20 +45,78 @@ endmodule
 
 module systolic_array_32x32 (
     input  wire clk,
-    input  wire rst_n,
+    input  wire rst,
     input  wire enable,
     input  wire valid_in,
     input  wire clear_acc,
     input  wire signed [7:0] matrix_a_in [0:31],    // 32 A values
     input  wire signed [7:0] matrix_b_in [0:31],    // 32 B values
     output wire valid_out,
-    output wire signed [23:0] matrix_c_out [0:31][0:31] // 32×32 C results
+    output wire signed [63:0] matrix_c_out [0:31][0:31] // 32×32 C results
 );
+
+    // -----------------------------------------------------------------------
+    // Input skew shift-registers
+    // Row i of A is delayed by i cycles so that A[i][k] and B[k][j] arrive
+    // at PE[i][j] on the same clock edge (after i+j pipeline stages each).
+    // Column j of B is delayed by j cycles for the same reason.
+    // valid_in is also delayed by i cycles along the A-skew path so it
+    // tracks the data window exactly.
+    // -----------------------------------------------------------------------
+    wire signed [7:0] a_skewed  [0:31];   // A after row-skew
+    wire signed [7:0] b_skewed  [0:31];   // B after col-skew
+    wire              v_skewed  [0:31];   // valid after row-skew
+
+    genvar sk;
+    generate
+        // Row 0 / Col 0 need no delay
+        assign a_skewed[0] = enable ? matrix_a_in[0] : 8'sd0;
+        assign b_skewed[0] = enable ? matrix_b_in[0] : 8'sd0;
+        assign v_skewed[0] = valid_in && enable;
+
+        for (sk = 1; sk < 32; sk = sk + 1) begin : skew_gen
+            // A-row skew: sk-stage shift register
+            reg signed [7:0] a_sr [0:sk-1];
+            reg              v_sr [0:sk-1];
+            integer           idx;
+            always @(posedge clk or posedge rst) begin
+                if (rst) begin
+                    for (idx = 0; idx < sk; idx = idx + 1) begin
+                        a_sr[idx] <= 8'sd0;
+                        v_sr[idx] <= 1'b0;
+                    end
+                end else begin
+                    a_sr[0] <= enable ? matrix_a_in[sk] : 8'sd0;
+                    v_sr[0] <= valid_in && enable;
+                    for (idx = 1; idx < sk; idx = idx + 1) begin
+                        a_sr[idx] <= a_sr[idx-1];
+                        v_sr[idx] <= v_sr[idx-1];
+                    end
+                end
+            end
+            assign a_skewed[sk] = a_sr[sk-1];
+            assign v_skewed[sk] = v_sr[sk-1];
+
+            // B-col skew: sk-stage shift register
+            reg signed [7:0] b_sr [0:sk-1];
+            always @(posedge clk or posedge rst) begin
+                if (rst) begin
+                    for (idx = 0; idx < sk; idx = idx + 1)
+                        b_sr[idx] <= 8'sd0;
+                end else begin
+                    b_sr[0] <= enable ? matrix_b_in[sk] : 8'sd0;
+                    for (idx = 1; idx < sk; idx = idx + 1)
+                        b_sr[idx] <= b_sr[idx-1];
+                end
+            end
+            assign b_skewed[sk] = b_sr[sk-1];
+        end
+    endgenerate
 
     wire signed [7:0] a_wire [0:31][0:31];
     wire signed [7:0] b_wire [0:31][0:31];
     wire valid_wire [0:31][0:31];
-    wire signed [23:0] c_wire [0:31][0:31];
+    wire signed [63:0] c_wire [0:31][0:31];
     
     genvar i, j;
     generate
@@ -66,11 +124,12 @@ module systolic_array_32x32 (
             for (j = 0; j < 32; j = j + 1) begin: col
                 pe_8bit pe_inst (
                     .clk(clk),
-                    .rst_n(rst_n && enable),
+                    .rst(rst),
                     .clear_acc(clear_acc),
-                    .valid_in( (i==0 && j==0) ? (valid_in && enable) : valid_wire[i==0 ? 0 : i-1][j==0 ? 0 : j-1]),
-                    .a_in( (j==0) ? matrix_a_in[i] : a_wire[i][j-1] ),
-                    .b_in( (i==0) ? matrix_b_in[j] : b_wire[i-1][j] ),
+                    // valid: row-0/col-0 gets skewed valid, others propagate right through a_wire
+                    .valid_in( (j==0) ? v_skewed[i] : valid_wire[i][j-1] ),
+                    .a_in( (j==0) ? a_skewed[i] : a_wire[i][j-1] ),
+                    .b_in( (i==0) ? b_skewed[j] : b_wire[i-1][j] ),
                     .valid_out(valid_wire[i][j]),
                     .a_out(a_wire[i][j]),
                     .b_out(b_wire[i][j]),
@@ -87,7 +146,7 @@ endmodule
 
 module mmu_modular_64x64 (
     input  wire clk,
-    input  wire rst_n,
+    input  wire rst,
     
     input  wire start,
     input  wire [1:0] mode,     // Operating mode: 00=64x64, 01=64x32, 10=Dual 64x32
@@ -101,8 +160,8 @@ module mmu_modular_64x64 (
     input  wire signed [7:0] matrix_a_row_b [0:63],     // For dual mode
     input  wire signed [7:0] matrix_b_col_b [0:63],     // For dual mode
     
-    output reg signed [23:0] result_c [0:63][0:63],
-    output reg signed [23:0] result_c_b [0:63][0:63],
+    output reg signed [63:0] result_c [0:63][0:63],
+    output reg signed [63:0] result_c_b [0:63][0:63],
     output reg result_valid,
     output reg result_valid_b
 );
@@ -115,7 +174,7 @@ module mmu_modular_64x64 (
         IDLE,         // Waiting for start signal
         CLEAR_ACC,    // Clear accumulators (only for K-tile 0)
         PREP_FEED,    // 1-cycle buffer after clearing
-        FEED,         // Feeding data for current K-tile (64 cycles)
+        FEED,         // Feeding data for current K-tile (32 cycles: feed_cycle 0-31)
         WAIT_FLUSH,   // Wait for data to propagate through arrays
         SAVE_RESULT,  // Copy results from arrays to output
         NEXT_K_TILE,  // Check if more K-tiles needed
@@ -149,34 +208,34 @@ module mmu_modular_64x64 (
     logic signed [7:0] b_in_10 [0:31];
     logic signed [7:0] b_in_11 [0:31];
     
-    logic signed [23:0] c_out_00 [0:31][0:31];
-    logic signed [23:0] c_out_01 [0:31][0:31];
-    logic signed [23:0] c_out_10 [0:31][0:31];
-    logic signed [23:0] c_out_11 [0:31][0:31];
+    logic signed [63:0] c_out_00 [0:31][0:31];
+    logic signed [63:0] c_out_01 [0:31][0:31];
+    logic signed [63:0] c_out_10 [0:31][0:31];
+    logic signed [63:0] c_out_11 [0:31][0:31];
     
     systolic_array_32x32 array_00 (         
-        .clk(clk), .rst_n(rst_n), .enable(enable_00),
+        .clk(clk), .rst(rst), .enable(enable_00),
         .valid_in(valid_in_00), .clear_acc(clear_acc_sig),
         .matrix_a_in(a_in_00), .matrix_b_in(b_in_00),
         .valid_out(valid_out_00), .matrix_c_out(c_out_00)
     );  // Top-left
     
     systolic_array_32x32 array_01 (
-        .clk(clk), .rst_n(rst_n), .enable(enable_01),
+        .clk(clk), .rst(rst), .enable(enable_01),
         .valid_in(valid_in_01), .clear_acc(clear_acc_sig),
         .matrix_a_in(a_in_01), .matrix_b_in(b_in_01),
         .valid_out(valid_out_01), .matrix_c_out(c_out_01)
     );  // Top-right   
     
     systolic_array_32x32 array_10 (
-        .clk(clk), .rst_n(rst_n), .enable(enable_10),
+        .clk(clk), .rst(rst), .enable(enable_10),
         .valid_in(valid_in_10), .clear_acc(clear_acc_sig),
         .matrix_a_in(a_in_10), .matrix_b_in(b_in_10),
         .valid_out(valid_out_10), .matrix_c_out(c_out_10)
     );  // Bottom-left 
     
     systolic_array_32x32 array_11 (
-        .clk(clk), .rst_n(rst_n), .enable(enable_11),
+        .clk(clk), .rst(rst), .enable(enable_11),
         .valid_in(valid_in_11), .clear_acc(clear_acc_sig),
         .matrix_a_in(a_in_11), .matrix_b_in(b_in_11),
         .valid_out(valid_out_11), .matrix_c_out(c_out_11)
@@ -217,9 +276,9 @@ module mmu_modular_64x64 (
     // =========================================================================
     // DATA ROUTING WITH K-TILING
     // =========================================================================
-    // For K-tile 0: feed K elements 0-31
-    // For K-tile 1: feed K elements 32-63
-    // Each tile takes 63 cycles (2*32-1)
+    // For K-tile 0: feed K elements 0-31  (feed_cycle 0-31)
+    // For K-tile 1: feed K elements 32-63 (feed_cycle 0-31, k_offset=32)
+    // Each tile takes exactly 32 feed cycles + 32 flush cycles to drain
     //
     // KEY: Each 32x32 array uses LOCAL indices 0-31
     // - Arrays 00, 01: Use A rows 0-31 (global), local indices 0-31
@@ -288,8 +347,9 @@ module mmu_modular_64x64 (
     end
     
     always_comb begin
-        // valid_in high during FEED state for cycles 0-63 (64 cycles)
-        if (state == FEED && feed_cycle <= 63) begin
+        // valid_in is high for the first 32 cycles of FEED (actual K data).
+        // FEED runs for 63 cycles total to flush the 31-deep A-skew registers.
+        if (state == FEED && feed_cycle < 32) begin
             valid_in_00 = enable_00;
             valid_in_01 = enable_01;
             valid_in_10 = enable_10;
@@ -305,8 +365,8 @@ module mmu_modular_64x64 (
     assign done = (state == DONE_STATE);
     assign busy = (state != IDLE);
     
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
             state <= IDLE;
             k_tile_32 <= 0;
             feed_cycle <= 0;
@@ -352,8 +412,11 @@ module mmu_modular_64x64 (
                 end
                 
                 FEED: begin
-                    // Try feeding for 64 cycles (0-63) to see if this fixes [0][0]
-                    if (feed_cycle <= 63) begin
+                    // Feed for 63 cycles per K-tile:
+                    //   Cycles 0-31: real K data (valid_in is high externally)
+                    //   Cycles 32-62: A-skew registers drain (valid_in stays low externally)
+                    // This ensures even row-31's skew register has flushed before WAIT_FLUSH.
+                    if (feed_cycle < 62) begin
                         feed_cycle <= feed_cycle + 1;
                     end else begin
                         state <= WAIT_FLUSH;
@@ -362,6 +425,9 @@ module mmu_modular_64x64 (
                 end
                 
                 WAIT_FLUSH: begin
+                    // After 63-cycle FEED, last data entered PE[31][0] at feed_cycle=62.
+                    // It propagates right to PE[31][31] in 31 more A-pipeline cycles.
+                    // Valid also propagates rightward 31 more steps. 32 cycles is safe.
                     if (flush_cycle < 32) begin
                         flush_cycle <= flush_cycle + 1;
                     end else begin

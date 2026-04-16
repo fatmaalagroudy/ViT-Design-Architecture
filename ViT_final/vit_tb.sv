@@ -28,9 +28,7 @@ module vit_tb;
     };
     
     // Instantiate Integrated DUT
-    vit_top_integrated #(
-        .BASE_DIR("C:/Users/user/Downloads/vit_new/export_quantized_new/")
-    ) dut (
+    vit_top_integrated dut (
         .clk(clk),
         .rst(rst),
         .start(start),
@@ -77,7 +75,7 @@ module vit_tb;
             end
             
             if (current_state == 15) begin // RES2
-                 //$display("[%0t]   [BLOCK_%0d] Completed.", $time, dut.b_curr);
+                 $display("[%0t]   [BLOCK_%0d] Completed.", $time, dut.b_curr);
             end
         end
     end

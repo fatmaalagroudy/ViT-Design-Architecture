@@ -2,8 +2,8 @@
 `timescale 1ns / 1ps
 
 module layernorm_pipelined #(
-    parameter int D = 256,
-    parameter string INV_SQRT_LUT = "C:/Users/user/Downloads/vit_new/export_quantized_new/inv_sqrt_lut.mem"
+    parameter int D = 256
+    //parameter string INV_SQRT_LUT = "C:/Users/DELTA2/Downloads/vit_final/vit_new/export_quantized_new/inv_sqrt_lut.mem"
 )(
     input  logic clk,
     input  logic rst,
@@ -17,6 +17,8 @@ module layernorm_pipelined #(
     output logic done
 );
 
+    import softmax_lut_pkg::*;
+    
     // Internal States
     typedef enum logic [2:0] {IDLE, MEAN, VAR, NORM, DONE_STATE} state_t;
     state_t state;
@@ -36,14 +38,6 @@ module layernorm_pipelined #(
     int lut_idx;
     logic signed [63:0] m_lut;
     logic signed [6:0] s_lut;
-
-    // LUT Storage
-    logic [31:0] inv_sqrt_lut [1024];
-    initial begin
-        for (int i=0; i<1024; i++) inv_sqrt_lut[i] = 32'h0; // Initialize to avoid x
-        $readmemh(INV_SQRT_LUT, inv_sqrt_lut);
-        if (inv_sqrt_lut[0] === 32'hx) $display("WARNING: LayerNorm LUT loading failed from %s", INV_SQRT_LUT);
-    end
 
     always_ff @(posedge clk or posedge rst) begin
         if (rst) begin
@@ -111,7 +105,7 @@ module layernorm_pipelined #(
                             lut_idx = ($signed(128'(norm_v)) - $signed(128'd536870912)) * $signed(128'd1023) / $signed(128'd1610612736);
                             if (lut_idx < 0) lut_idx = 0; if (lut_idx > 1023) lut_idx = 1023;
                             
-                            m_lut = $signed(64'(inv_sqrt_lut[lut_idx]));
+                            m_lut = $signed(64'(INV_SQRT_LUT[lut_idx]));
                             s_lut = 45 + (shift_val >>> 1);
                             
                             if (variance <= 0) begin m_lut = 64'd1073741824; s_lut = 0; end

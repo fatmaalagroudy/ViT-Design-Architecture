@@ -3,8 +3,7 @@
 
 module gelu_pipelined #(
     parameter int N = 64,
-    parameter int D = 768, // MLP dimension
-    parameter string GELU_LUT = "C:/Users/user/Downloads/vit_new/export_quantized_new/gelu_lut.mem"
+    parameter int D = 768 // MLP dimension
 )(
     input  logic clk,
     input  logic rst,
@@ -19,20 +18,26 @@ module gelu_pipelined #(
     typedef enum logic [1:0] {IDLE, COMPUTE, DONE_STATE} state_t;
     state_t state;
     logic [15:0] i_cnt, d_cnt;
+
+    logic [8:0] lut_addr;
+    logic signed [31:0] lut_data;
+
+    // Instantiate LUT ROM
+    gelu_lut lut_inst (
+        .addr(lut_addr),
+        .data(lut_data)
+    );
     
-    logic signed [31:0] gelu_lut [512];
-    initial begin
-        for (int i=0; i<512; i++) gelu_lut[i] = 32'h0;
-        $readmemh(GELU_LUT, gelu_lut);
-        if (gelu_lut[256] === 32'hx) $display("WARNING: GELU LUT loading failed");
-    end
+    int idx;
+    logic [8:0] lut_addr_r;
 
     always_ff @(posedge clk or posedge rst) begin
         if (rst) begin
             state <= IDLE;
-            done <= 0;
+            done  <= 0;
             i_cnt <= 0;
             d_cnt <= 0;
+            lut_addr_r <= 0;
         end else begin
             case (state)
                 IDLE: begin
@@ -43,18 +48,17 @@ module gelu_pipelined #(
                         d_cnt <= 0;
                     end
                 end
-                
+
                 COMPUTE: begin
                     if (i_cnt < N) begin
                         if (d_cnt < D) begin
-                            automatic logic signed [127:0] val128 = $signed(x_in[i_cnt][d_cnt]);
-                            automatic int idx_offset = int'( (val128 * $signed(128'(m_idx))) >>> s_idx );
-                            automatic int idx = 256 + idx_offset;
-                            if (idx < 0) idx = 0; if (idx > 511) idx = 511;
+                            //val128     = $signed(x_in[i_cnt][d_cnt]);
+                            //idx_offset = int'((val128 * $signed(m_idx)) >>> s_idx);
                             
-                            // Output high-precision LUT value directly
-                            x_out[i_cnt][d_cnt] <= gelu_lut[idx];
-                            
+
+                            // write previous cycle LUT output
+                            x_out[i_cnt][d_cnt] <= lut_data;
+
                             d_cnt <= d_cnt + 1;
                         end else begin
                             d_cnt <= 0;
@@ -64,13 +68,23 @@ module gelu_pipelined #(
                         state <= DONE_STATE;
                     end
                 end
-                
+
                 DONE_STATE: begin
-                    done <= 1;
+                    done  <= 1;
                     state <= IDLE;
                 end
             endcase
         end
     end
+
+    always @(*) begin
+        idx        = 256 + int'(($signed(x_in[i_cnt][d_cnt]) * $signed(m_idx)) >>> s_idx);
+        if (idx < 0)   idx = 0;
+        else if (idx > 511) idx = 511;
+
+        lut_addr = idx[8:0];
+    end
+
+    //assign lut_addr = lut_addr_r;
 
 endmodule
